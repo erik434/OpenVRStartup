@@ -6,9 +6,10 @@ namespace OpenVRStartup
     {
         public static void PrintColor(String text, ConsoleColor color = ConsoleColor.White)
         {
+            var oldColor = Console.ForegroundColor;
             Console.ForegroundColor = color;
             Console.WriteLine(text);
-            Console.ForegroundColor = ConsoleColor.White;
+            Console.ForegroundColor = oldColor;
         }
 
         public static void Print(String text)

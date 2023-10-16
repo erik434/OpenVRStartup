@@ -11,14 +11,20 @@ namespace OpenVRStartup
     class Program
     {
         static readonly string PATH_LOGFILE = "./OpenVRStartup.log";
+        static readonly string PATH_BOOTFOLDER = "./boot/";
         static readonly string PATH_STARTFOLDER = "./start/";
         static readonly string PATH_STOPFOLDER = "./stop/";
         static readonly string FILE_PATTERN = "*.cmd";
 
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-        public const int SW_SHOWMINIMIZED = 2;
-        private volatile static bool _isReady = false;
+        public const int SW_MINIMIZE = 6; // This should minimize the window and let some other app remain active
+        // See https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow
+
+        static ManualResetEventSlim _isReady = new ManualResetEventSlim(false);
+        static ManualResetEventSlim _isConnected = new ManualResetEventSlim(false);
+
+        static CancellationTokenSource _cts = new CancellationTokenSource();
 
         static void Main(string[] _)
         {
@@ -31,13 +37,9 @@ namespace OpenVRStartup
             if (!t.IsAlive) t.Start();
             else LogUtils.WriteLineToCache("Error: Could not start worker thread");
 
-            // Check if first run, if so do NOT minimize but write instructions.
-            if (LogUtils.LogFileExists(PATH_LOGFILE))
+            // Check if first run, if so do NOT minimize yet - write instructions and wait for acknowledgement
+            if (!LogUtils.LogFileExists(PATH_LOGFILE))
             {
-                _isReady = true;
-                Minimize();
-            }
-            else {
                 Utils.PrintInfo("\n========================");
                 Utils.PrintInfo(" First Run Instructions ");
                 Utils.PrintInfo("========================");
@@ -47,61 +49,90 @@ namespace OpenVRStartup
                 Utils.Print("\nThis message is only shown once, to see it again delete the log file.");
                 Utils.Print("\nPress [Enter] in this window to continue execution.\nIf there are shutdown scripts the window will remain in the task bar.");
                 Console.ReadLine();
-                Minimize();
-                _isReady = true;
             }
 
+            // Indicate that we're ready for the worker to do its thing, minimize, and wait for an [Enter] key to manually exit
+            _isReady.Set();
+            Minimize();
+
+            Thread.Sleep(TimeSpan.FromSeconds(2));
+            Utils.Print("\nPress [Enter] to force quit");
             Console.ReadLine();
-            t.Abort();
 
-            OpenVR.Shutdown();
+            // If manually exiting, tell the woker thread to cancel and wait for it to wrap up before quitting
+            _cts.Cancel();
+            t.Join(); // This shouldn't ever finish because the thread should exit the process when it finishes
         }
 
-        private static void Minimize() {
+        private static void Minimize()
+        {
             IntPtr winHandle = Process.GetCurrentProcess().MainWindowHandle;
-            ShowWindow(winHandle, SW_SHOWMINIMIZED);
+            ShowWindow(winHandle, SW_MINIMIZE);
         }
-
-        private static bool _isConnected = false;
 
         private static void Worker()
         {
-            var shouldRun = true;
-
             Thread.CurrentThread.IsBackground = true;
-            while (shouldRun)
+
+            // Run BOOT scripts immediately without waiting for OpenVR connection or anything
+            // This doesn't seem to make much difference (not much longer before we run START scripts) but might
+            // help with powering up base stations a tiny bit quicker; main delay in a 'normal' SteamVR startup
+            // seems to be just waiting for it to initialize itself to the point where it starts loading overlays
+            // like this little helper
+            Utils.Print("Running BOOT scripts");
+            RunScripts(PATH_BOOTFOLDER);
+
+            var token = _cts.Token;
+            while (!token.IsCancellationRequested)
             {
-                if (!_isConnected)
+                if (!_isConnected.IsSet)
                 {
-                    Thread.Sleep(1000);
-                    _isConnected = InitVR();
+                    // If we haven't yet connected to OpenVR, try now
+                    InitVR();
                 }
-                else if(_isReady)
+
+                if (_isConnected.IsSet && _isReady.IsSet)
                 {
+                    // We're connected to OpenVR and ready to run START scripts
+                    Utils.Print("Running START scripts");
                     RunScripts(PATH_STARTFOLDER);
-                    if(WeHaveScripts(PATH_STOPFOLDER)) WaitForQuit();
-                    OpenVR.Shutdown();
-                    RunScripts(PATH_STOPFOLDER);
-                    shouldRun = false;
+
+                    // If we have STOP scripts, wait to run them until SteamVR is exiting
+                    if (WeHaveScripts(PATH_STOPFOLDER))
+                    {
+                        WaitForQuit();
+                        Utils.Print("Running STOP scripts");
+                        RunScripts(PATH_STOPFOLDER);
+                    }
+
+                    // STOP scripts (if any) have run - signal completion (for anyone else that might be listening) and exit the loop
+                    _cts.Cancel();
+                    break;
                 }
-                if (!shouldRun)
-                {
-                    LogUtils.WriteLineToCache("Application exiting, writing log");
-                    LogUtils.WriteCacheToLogFile(PATH_LOGFILE, 100);
-                    Environment.Exit(0);
-                }
+
+                // Brief sleep while waiting to connect to OpenVR and for the main thread to signal readiness
+                Thread.Sleep(100);
             }
+
+            // Flush log to file before we exit
+            LogUtils.WriteLineToCache("Application exiting, writing log");
+            LogUtils.WriteCacheToLogFile(PATH_LOGFILE, 100);
+
+            if (_isConnected.IsSet)
+            {
+                OpenVR.Shutdown();
+            }
+            Environment.Exit(0);
         }
-        
+
         // Initializing connection to OpenVR
-        private static bool InitVR()
+        private static void InitVR()
         {
             var error = EVRInitError.None;
             OpenVR.Init(ref error, EVRApplicationType.VRApplication_Overlay);
             if (error != EVRInitError.None)
             {
                 LogUtils.WriteLineToCache($"Error: OpenVR init failed: {Enum.GetName(typeof(EVRInitError), error)}");
-                return false;
             }
             else
             {
@@ -114,17 +145,20 @@ namespace OpenVRStartup
                     var manifestError = OpenVR.Applications.AddApplicationManifest(Path.GetFullPath("./app.vrmanifest"), false);
                     if (manifestError == EVRApplicationError.None) LogUtils.WriteLineToCache("Successfully installed app manifest");
                     else LogUtils.WriteLineToCache($"Error: Failed to add app manifest: {Enum.GetName(typeof(EVRApplicationError), manifestError)}");
-                    
+
                     var autolaunchError = OpenVR.Applications.SetApplicationAutoLaunch(appKey, true);
                     if (autolaunchError == EVRApplicationError.None) LogUtils.WriteLineToCache("Successfully set app to auto launch");
                     else LogUtils.WriteLineToCache($"Error: Failed to turn on auto launch: {Enum.GetName(typeof(EVRApplicationError), autolaunchError)}");
                 }
-                return true;
+
+                // Set _isConnected to indicate we've initialized OpenVR and can proceed
+                _isConnected.Set();
             }
         }
 
         // Scripts
-        private static void RunScripts(string folder) {
+        private static void RunScripts(string folder)
+        {
             try
             {
                 if (!Directory.Exists(folder)) Directory.CreateDirectory(folder);
@@ -152,8 +186,9 @@ namespace OpenVRStartup
         private static void WaitForQuit()
         {
             Utils.Print("This window remains to wait for the shutdown of SteamVR to run additional scripts on exit.");
-            var shouldRun = true;
-            while(shouldRun)
+            var token = _cts.Token;
+
+            while (!token.IsCancellationRequested)
             {
                 var vrEvents = new List<VREvent_t>();
                 var vrEvent = new VREvent_t();
@@ -175,11 +210,15 @@ namespace OpenVRStartup
                     if ((EVREventType)e.eventType == EVREventType.VREvent_Quit)
                     {
                         OpenVR.System.AcknowledgeQuit_Exiting();
-                        shouldRun = false;
+                        Utils.Print("OpenVR exiting...");
+                        _cts.Cancel();
                     }
                 }
+
+                // Longer wait when polling for OpenVR events
                 Thread.Sleep(1000);
             }
+            Utils.Print("WaitForQuit finished");
         }
 
         private static bool WeHaveScripts(string folder)
